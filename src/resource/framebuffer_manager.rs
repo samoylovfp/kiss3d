@@ -1,6 +1,7 @@
 //! Resource manager to allocate and switch between framebuffers.
 
 use context::{Context, Framebuffer, Texture};
+use std::rc::Rc;
 
 #[path = "../error.rs"]
 mod error;
@@ -11,6 +12,8 @@ pub enum RenderTarget {
     Screen,
     /// An off-screen buffer.
     Offscreen(OffscreenBuffers),
+    /// An existing RGBA texture
+    Texture(Rc<Texture>)
 }
 
 /// OpenGL identifiers to an off-screen buffer.
@@ -24,9 +27,10 @@ impl RenderTarget {
     ///
     /// Returns `None` if the texture is off-screen.
     pub fn texture_id(&self) -> Option<&Texture> {
-        match *self {
+        match self {
             RenderTarget::Screen => None,
             RenderTarget::Offscreen(ref o) => Some(&o.texture),
+            RenderTarget::Texture(tex) => Some(tex.as_ref())
         }
     }
 
@@ -36,48 +40,46 @@ impl RenderTarget {
     #[cfg(not(any(target_arch = "wasm32", target_arch = "asmjs")))]
     pub fn depth_id(&self) -> Option<&Texture> {
         match *self {
-            RenderTarget::Screen => None,
+            RenderTarget::Screen| RenderTarget::Texture(..) => None,
             RenderTarget::Offscreen(ref o) => o.depth.as_ref(),
         }
+    }
+
+    fn resize_tex(w: f32, h: f32, component: u32, texture: &Texture) {
+        let ctxt = Context::get();
+        // Update the fbo
+        verify!(ctxt.bind_texture(Context::TEXTURE_2D, Some(texture)));
+        verify!(ctxt.tex_image2d(
+            Context::TEXTURE_2D,
+            0,
+            component as i32,
+            w as i32,
+            h as i32,
+            0,
+            component,
+            None
+        ));
+        verify!(ctxt.bind_texture(Context::TEXTURE_2D, None));
     }
 
     /// Resizes this render target.
     pub fn resize(&mut self, w: f32, h: f32) {
         let ctxt = Context::get();
 
-        match *self {
+        match self {
             RenderTarget::Screen => {
                 verify!(ctxt.viewport(0, 0, w as i32, h as i32));
             }
-            RenderTarget::Offscreen(ref o) => {
-                // Update the fbo
-                verify!(ctxt.bind_texture(Context::TEXTURE_2D, Some(&o.texture)));
-                verify!(ctxt.tex_image2d(
-                    Context::TEXTURE_2D,
-                    0,
-                    Context::RGBA as i32,
-                    w as i32,
-                    h as i32,
-                    0,
-                    Context::RGBA,
-                    None
-                ));
-                verify!(ctxt.bind_texture(Context::TEXTURE_2D, None));
-
+            RenderTarget::Offscreen(OffscreenBuffers{ref texture, depth}) => {
+                RenderTarget::resize_tex(w, h, Context::RGBA, texture);
                 if cfg!(not(any(target_arch = "wasm32", target_arch = "asmjs"))) {
-                    verify!(ctxt.bind_texture(Context::TEXTURE_2D, o.depth.as_ref()));
-                    verify!(ctxt.tex_image2d(
-                        Context::TEXTURE_2D,
-                        0,
-                        Context::DEPTH_COMPONENT as i32,
-                        w as i32,
-                        h as i32,
-                        0,
-                        Context::DEPTH_COMPONENT,
-                        None
-                    ));
-                    verify!(ctxt.bind_texture(Context::TEXTURE_2D, None));
+                    if let Some(ref t) = depth {
+                        RenderTarget::resize_tex(w, h, Context::DEPTH_COMPONENT, t);
+                    }
                 }
+            }
+            RenderTarget::Texture(t) =>{
+                RenderTarget::resize_tex(w, h, Context::RGBA, t)
             }
         }
     }
@@ -108,19 +110,15 @@ impl FramebufferManager {
             fbo: fbo,
         }
     }
+    /// Switches framebuffer to provided texture
+    pub fn render_target_from_texture(texture: Rc<Texture>, width: usize, height: usize) -> RenderTarget {
+        FramebufferManager::setup_texture_for_fbo(&texture, Context::RGBA, width, height);
+        RenderTarget::Texture(texture)
+    }
 
-    /// Creates a new render target. A render target is the combination of a color buffer and a
-    /// depth buffer.
-    pub fn new_render_target(width: usize, height: usize) -> RenderTarget {
+    fn setup_texture_for_fbo(texture: &Texture, component: u32, width: usize, height: usize) {
         let ctxt = Context::get();
-
-        /* Texture */
-        verify!(ctxt.active_texture(Context::TEXTURE0));
-        let fbo_texture = verify!(
-            ctxt.create_texture()
-                .expect("Failde to create framebuffer object texture.")
-        );
-        verify!(ctxt.bind_texture(Context::TEXTURE_2D, Some(&fbo_texture)));
+        verify!(ctxt.bind_texture(Context::TEXTURE_2D, Some(texture)));
         verify!(ctxt.tex_parameteri(
             Context::TEXTURE_2D,
             Context::TEXTURE_MAG_FILTER,
@@ -144,52 +142,40 @@ impl FramebufferManager {
         verify!(ctxt.tex_image2d(
             Context::TEXTURE_2D,
             0,
-            Context::RGBA as i32,
+            component as i32,
             width as i32,
             height as i32,
             0,
-            Context::RGBA,
+            component,
             None
         ));
         verify!(ctxt.bind_texture(Context::TEXTURE_2D, None));
+
+    }
+
+    /// Creates a new render target. A render target is the combination of a color buffer and a
+    /// depth buffer.
+    pub fn new_render_target(width: usize, height: usize) -> RenderTarget {
+        let ctxt = Context::get();
+
+        /* Texture */
+        verify!(ctxt.active_texture(Context::TEXTURE0));
+        let fbo_texture = verify!(
+            ctxt.create_texture()
+                .expect("Failed to create framebuffer object texture.")
+        );
+
+        FramebufferManager::setup_texture_for_fbo(
+            &fbo_texture, Context::RGBA, width, height
+        );
 
         /* Depth buffer */
         if cfg!(not(any(target_arch = "wasm32", target_arch = "asmjs"))) {
             verify!(ctxt.active_texture(Context::TEXTURE1));
             let fbo_depth = verify!(ctxt.create_texture().expect("Failed to create a texture."));
-            verify!(ctxt.bind_texture(Context::TEXTURE_2D, Some(&fbo_depth)));
-            verify!(ctxt.tex_parameteri(
-                Context::TEXTURE_2D,
-                Context::TEXTURE_MAG_FILTER,
-                Context::LINEAR as i32
-            ));
-            verify!(ctxt.tex_parameteri(
-                Context::TEXTURE_2D,
-                Context::TEXTURE_MIN_FILTER,
-                Context::LINEAR as i32
-            ));
-            verify!(ctxt.tex_parameteri(
-                Context::TEXTURE_2D,
-                Context::TEXTURE_WRAP_S,
-                Context::CLAMP_TO_EDGE as i32
-            ));
-            verify!(ctxt.tex_parameteri(
-                Context::TEXTURE_2D,
-                Context::TEXTURE_WRAP_T,
-                Context::CLAMP_TO_EDGE as i32
-            ));
-            verify!(ctxt.tex_image2di(
-                Context::TEXTURE_2D,
-                0,
-                Context::DEPTH_COMPONENT as i32,
-                width as i32,
-                height as i32,
-                0,
-                Context::DEPTH_COMPONENT,
-                None
-            ));
-            verify!(ctxt.bind_texture(Context::TEXTURE_2D, None));
-
+            FramebufferManager::setup_texture_for_fbo(
+                &fbo_depth, Context::RGBA, width, height
+            );
             RenderTarget::Offscreen(OffscreenBuffers {
                 texture: fbo_texture,
                 depth: Some(fbo_depth),
@@ -231,6 +217,27 @@ impl FramebufferManager {
                     Context::DEPTH_ATTACHMENT,
                     Context::TEXTURE_2D,
                     o.depth.as_ref(),
+                    0
+                ));
+            }
+            RenderTarget::Texture(ref t) => {
+                let ctxt = Context::get();
+                self.select_fbo();
+
+                // FIXME: don't switch if the current texture is
+                // already o.texture ?
+                verify!(ctxt.framebuffer_texture2d(
+                    Context::FRAMEBUFFER,
+                    Context::COLOR_ATTACHMENT0,
+                    Context::TEXTURE_2D,
+                    Some(t),
+                    0
+                ));
+                verify!(ctxt.framebuffer_texture2d(
+                    Context::FRAMEBUFFER,
+                    Context::DEPTH_ATTACHMENT,
+                    Context::TEXTURE_2D,
+                    None,
                     0
                 ));
             }
